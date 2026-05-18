@@ -380,6 +380,123 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                             ContentFile(scorm_zipfile.read(zipinfo.filename)),
                         )
 
+    def add_xml_to_node(self, node):
+        """
+        Export hook. The platform sets ``runtime.export_fs`` to the OLX
+        export filesystem before calling this. We re-zip the extracted
+        package out of ``default_storage`` into that filesystem so the
+        block roundtrips through OLX export/import. Outside an export
+        context ``export_fs`` is None and this is a pass-through.
+        """
+        super().add_xml_to_node(node)
+
+        export_fs = getattr(self.runtime, "export_fs", None)
+        if export_fs is None:
+            return
+        if not self.package_meta or "sha1" not in self.package_meta:
+            return
+        if not self.path_exists(self.extract_folder_path):
+            return
+
+        zip_relpath = f"scorm/{self.url_name}/package.zip"
+        try:
+            export_fs.makedirs(os.path.dirname(zip_relpath), recreate=True)
+            with export_fs.open(zip_relpath, "wb") as out:
+                self._rezip_extracted_package(out)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to bundle SCORM package into OLX export")
+            return
+
+        node.set("scorm_package_path", zip_relpath)
+
+    @classmethod
+    def parse_xml(cls, node, runtime, keys):
+        """
+        Import hook. After the base class restores fields from XML
+        attributes (so ``package_meta`` and therefore ``extract_folder_path``
+        are populated), look for the package zip the exporter wrote into
+        the OLX tarball and re-extract it into ``default_storage``.
+        """
+        block = super().parse_xml(node, runtime, keys)
+
+        zip_relpath = node.get("scorm_package_path")
+        resources_fs = getattr(runtime, "resources_fs", None)
+        if not zip_relpath or resources_fs is None:
+            return block
+        if not resources_fs.exists(zip_relpath):
+            return block
+
+        # During OLX import the block's ``scope_ids.usage_id`` is keyed to
+        # the source course (the one being imported FROM). The block is
+        # then persisted under the target course's keys.
+        # ``extract_folder_base_path`` hashes ``scope_ids.usage_id`` to
+        # locate files on disk, so extracting under the source key lands
+        # files where the rendered block (keyed to the target course)
+        # cannot find them. Re-key the block in place for the duration
+        # of extraction so files end up where they will be looked up.
+        target_usage_id = cls._target_usage_id_for_import(node, runtime)
+        original_scope_ids = block.scope_ids
+        if target_usage_id is not None and target_usage_id != original_scope_ids.usage_id:
+            block.scope_ids = original_scope_ids._replace(usage_id=target_usage_id)
+
+        try:
+            with resources_fs.open(zip_relpath, "rb") as zip_file:
+                block.extract_package(zip_file)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to rehydrate SCORM package from OLX import")
+        finally:
+            if block.scope_ids is not original_scope_ids:
+                block.scope_ids = original_scope_ids
+
+        return block
+
+    @classmethod
+    def _target_usage_id_for_import(cls, node, runtime):
+        """
+        During OLX import, ``runtime.id_generator`` is a
+        ``CourseImportLocationManager`` that carries ``target_course_id``
+        — the course the block will be persisted under. Combine it with
+        the preserved ``url_name`` (which becomes ``block_id``) to get
+        the usage_id the rendered block will eventually see. Returns
+        ``None`` for runtimes that don't expose this (no-op fallback).
+        """
+        id_generator = getattr(runtime, "id_generator", None)
+        target_course_id = getattr(id_generator, "target_course_id", None)
+        if target_course_id is None:
+            return None
+        url_name = node.get("url_name")
+        if not url_name:
+            return None
+        try:
+            return target_course_id.make_usage_key(node.tag, url_name)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _rezip_extracted_package(self, out_file):
+        """
+        Stream a fresh zip of the extracted SCORM tree into ``out_file``.
+        Files are read from ``self.storage`` and written through ``zf.open``
+        in chunks so the whole archive is never held in memory at once.
+        """
+        root = self.extract_folder_path
+        with zipfile.ZipFile(out_file, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            stack = [root]
+            while stack:
+                cur = stack.pop()
+                try:
+                    dirs, files = self.storage.listdir(cur)
+                except (FileNotFoundError, NotImplementedError):
+                    continue
+                for d in dirs:
+                    stack.append(os.path.join(cur, d))
+                for f in files:
+                    src_path = os.path.join(cur, f)
+                    arcname = os.path.relpath(src_path, root)
+                    with self.storage.open(src_path, "rb") as fh:
+                        with zf.open(arcname, "w", force_zip64=True) as zout:
+                            for chunk in iter(lambda fh=fh: fh.read(1024 * 1024), b""):
+                                zout.write(chunk)
+
     @property
     def index_page_url(self):
         if not self.package_meta or not self.index_page_path:
