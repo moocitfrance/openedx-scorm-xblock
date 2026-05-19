@@ -231,7 +231,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         Response object containing the content of the requested file with the appropriate content type.
         """
         file_name = os.path.basename(suffix)
-        file_path = self.find_file_path(file_name)        
+        file_path = self.find_file_path(file_name)
         file_type, _ = mimetypes.guess_type(file_name)
         with self.storage.open(file_path) as response:
             file_content = response.read()
@@ -497,10 +497,85 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                             for chunk in iter(lambda fh=fh: fh.read(1024 * 1024), b""):
                                 zout.write(chunk)
 
+    def _rehydrate_extract_folder_if_missing(self):
+        """
+        Self-healing: if our extract folder is empty but we know our sha1,
+        search ``scorm_location()`` for another bucket containing the
+        same sha1 directory and copy its tree into our extract folder.
+
+        This covers operations that duplicate block metadata without
+        touching storage — notably course rerun, which clones blocks at
+        the modulestore level and never invokes ``parse_xml``. Cached
+        per block instance via ``_extract_folder_verified`` so repeated
+        calls during a single request (e.g. many ``assets_proxy`` hits)
+        don't keep listing storage.
+        """
+        if getattr(self, "_extract_folder_verified", False):
+            return
+        self._extract_folder_verified = True
+
+        if not self.package_meta or "sha1" not in self.package_meta:
+            return
+        if self.path_exists(self.extract_folder_path):
+            return
+
+        sha1 = self.package_meta["sha1"]
+        scorm_root = self.scorm_location()
+
+        try:
+            bucket_dirs, _ = self.storage.listdir(scorm_root)
+        except (FileNotFoundError, NotImplementedError):
+            return
+
+        own_bucket = os.path.basename(self.extract_folder_base_path)
+        for bucket in bucket_dirs:
+            if bucket == own_bucket:
+                continue
+            candidate = os.path.join(scorm_root, bucket, sha1)
+            if not self.path_exists(candidate):
+                continue
+            try:
+                self._copy_storage_tree(candidate, self.extract_folder_path)
+                logger.info(
+                    "Rehydrated SCORM extract folder for %s from %s",
+                    self.scope_ids.usage_id, candidate,
+                )
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "Failed to rehydrate SCORM extract folder for %s from %s",
+                    self.scope_ids.usage_id, candidate,
+                )
+            return
+
+    def _copy_storage_tree(self, src_root, dst_root):
+        """
+        Recursively copy every file under ``src_root`` to ``dst_root``
+        using the Django storage API. Both paths are storage-relative —
+        we never touch the local filesystem directly, so this works on
+        S3 and filesystem backends alike.
+        """
+        stack = [src_root]
+        while stack:
+            cur = stack.pop()
+            try:
+                dirs, files = self.storage.listdir(cur)
+            except (FileNotFoundError, NotImplementedError):
+                continue
+            for d in dirs:
+                stack.append(os.path.join(cur, d))
+            for f in files:
+                src_path = os.path.join(cur, f)
+                relpath = os.path.relpath(src_path, src_root)
+                dst_path = os.path.join(dst_root, relpath)
+                with self.storage.open(src_path, "rb") as src_fh:
+                    self.storage.save(dst_path, ContentFile(src_fh.read()))
+
     @property
     def index_page_url(self):
         if not self.package_meta or not self.index_page_path:
             return ""
+
+        self._rehydrate_extract_folder_if_missing()
         
         # Serve assets by proxying them through the LMS by default
         if self.xblock_settings.get("PROXY_ASSETS_LMS", True):
