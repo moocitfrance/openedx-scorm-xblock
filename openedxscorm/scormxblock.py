@@ -8,6 +8,7 @@ import zipfile
 import mimetypes
 import urllib
 
+from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db.models import Q
@@ -485,7 +486,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                 cur = stack.pop()
                 try:
                     dirs, files = self.storage.listdir(cur)
-                except (FileNotFoundError, NotImplementedError):
+                except FileNotFoundError:
                     continue
                 for d in dirs:
                     stack.append(os.path.join(cur, d))
@@ -505,18 +506,24 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
 
         This covers operations that duplicate block metadata without
         touching storage — notably course rerun, which clones blocks at
-        the modulestore level and never invokes ``parse_xml``. Cached
-        per block instance via ``_extract_folder_verified`` so repeated
-        calls during a single request (e.g. many ``assets_proxy`` hits)
-        don't keep listing storage.
+        the modulestore level and never invokes ``parse_xml``.
+
+        Idempotency is enforced via Django's cache, keyed by
+        ``scope_ids.usage_id``. Course rerun and OLX import both mint a
+        new ``usage_id``, so the cache key naturally misses and a fresh
+        verification fires once on first render of the new block. On
+        success the key is set and subsequent renders short-circuit
+        without listing storage.
         """
-        if getattr(self, "_extract_folder_verified", False):
+        cache_key = f"scorm_xblock:extract_verified:{self.scope_ids.usage_id}"
+        if cache.get(cache_key):
             return
-        self._extract_folder_verified = True
 
         if not self.package_meta or "sha1" not in self.package_meta:
             return
+
         if self.path_exists(self.extract_folder_path):
+            cache.set(cache_key, True, timeout=None)
             return
 
         sha1 = self.package_meta["sha1"]
@@ -524,7 +531,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
 
         try:
             bucket_dirs, _ = self.storage.listdir(scorm_root)
-        except (FileNotFoundError, NotImplementedError):
+        except FileNotFoundError:
             return
 
         own_bucket = os.path.basename(self.extract_folder_base_path)
@@ -540,6 +547,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                     "Rehydrated SCORM extract folder for %s from %s",
                     self.scope_ids.usage_id, candidate,
                 )
+                cache.set(cache_key, True, timeout=None)
             except Exception:  # pylint: disable=broad-except
                 logger.exception(
                     "Failed to rehydrate SCORM extract folder for %s from %s",
@@ -559,7 +567,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
             cur = stack.pop()
             try:
                 dirs, files = self.storage.listdir(cur)
-            except (FileNotFoundError, NotImplementedError):
+            except FileNotFoundError:
                 continue
             for d in dirs:
                 stack.append(os.path.join(cur, d))
