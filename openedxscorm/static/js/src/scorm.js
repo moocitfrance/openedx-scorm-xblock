@@ -1,11 +1,13 @@
-function SCORM_12_API(GetValue, SetValue) {
+function SCORM_12_API(GetValue, SetValue, Commit) {
   this.LMSInitialize = function () {
     return "true";
   };
   this.LMSFinish = function () {
+    Commit();
     return "true";
   };
   this.LMSCommit = function () {
+    Commit();
     return "true";
   };
   this.LMSGetLastError = function () {
@@ -21,14 +23,16 @@ function SCORM_12_API(GetValue, SetValue) {
   this.LMSSetValue = SetValue;
 }
 
-function SCORM_2004_API(GetValue, SetValue) {
+function SCORM_2004_API(GetValue, SetValue, Commit) {
   this.Initialize = function () {
     return "true";
   };
   this.Terminate = function () {
+    Commit();
     return "true";
   };
   this.Commit = function () {
+    Commit();
     return "true";
   };
   this.GetLastError = function () {
@@ -44,10 +48,13 @@ function SCORM_2004_API(GetValue, SetValue) {
   this.SetValue = SetValue;
 }
 
-function initScorm(scormVersion, getValueFunc, setValueFunc) {
+function initScorm(scormVersion, getValueFunc, setValueFunc, commitFunc) {
+  commitFunc = commitFunc || function () {
+    return "true";
+  };
   if (scormVersion == 'SCORM_12') {
-    API = new SCORM_12_API(getValueFunc, setValueFunc);
+    API = new SCORM_12_API(getValueFunc, setValueFunc, commitFunc);
   } else {
-    API_1484_11 = new SCORM_2004_API(getValueFunc, setValueFunc);
+    API_1484_11 = new SCORM_2004_API(getValueFunc, setValueFunc, commitFunc);
   }
 }

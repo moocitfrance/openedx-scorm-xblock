@@ -1,0 +1,1 @@
+- [Bugfix] Stop making synchronous HTTP requests from SCORM `GetValue`. Runtime values are now returned from a local cache, `SetValue` updates that cache immediately, and queued persistence is debounced/flushed on SCORM commit calls to avoid freezing learner interactions. (by @moocitfrance)

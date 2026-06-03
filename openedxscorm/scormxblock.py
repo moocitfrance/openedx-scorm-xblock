@@ -209,6 +209,9 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                 "popup_width": self.width or 800,
                 "popup_height": self.height or 800,
                 "scorm_data": self.scorm_data,
+                "lesson_status": self.lesson_status,
+                "success_status": self.success_status,
+                "lesson_score": self.lesson_score,
                 "block_height": self.height or 450,
             },
         )

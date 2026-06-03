@@ -180,39 +180,79 @@ function ScormXBlock(runtime, element, settings) {
             navigationClick = true;
          });
         
-    // We only make calls to the get_value handler when absolutely required.
-    // These calls are synchronous and they can easily clog the scorm display.
-    var uncachedValues = [
-        "cmi.core.lesson_status",
-        "cmi.completion_status",
-        "cmi.success_status",
-        "cmi.core.score.raw",
-        "cmi.score.raw",
-        "cmi.score.scaled",
-        "cmi.mode"
-    ];
-    var getValueUrl = runtime.handlerUrl(element, 'scorm_get_value');
-    var GetValue = function (cmi_element) {   
-        // Only make a call if navigation menu was not used
-        // Otherwise the synchronous calls are blocked by chromium on page unload
-        if (uncachedValues.includes(cmi_element) && !navigationClick){
-            $.ajax({
-                type: "POST",
-                url: getValueUrl,
-                data: JSON.stringify({
-                    'name': cmi_element,
-                    'url': window.location.href
-                }),
-                async: false,
-                success: function (response) {
-                    // Set to false to allow for other calls by the SCORM api
-                    navigationClick = false;
-                    return response.value;
-                }
-            });
-        } else if (cmi_element in settings.scorm_data) {
+    var scormData = settings.scorm_data || {};
+    settings.scorm_data = scormData;
+
+    function formatScormValue(value) {
+        if (value === null || typeof value === "undefined") {
+            return "";
+        }
+        return String(value);
+    }
+
+    function getMode() {
+        return window.location.href.indexOf("preview") >= 0 ? "review" : "normal";
+    }
+
+    function cacheInitialScormValues() {
+        scormData["cmi.core.lesson_status"] = formatScormValue(settings.lesson_status || "not attempted");
+        scormData["cmi.completion_status"] = formatScormValue(settings.lesson_status || "not attempted");
+        scormData["cmi.success_status"] = formatScormValue(settings.success_status || "unknown");
+        scormData["cmi.core.score.raw"] = formatScormValue((settings.lesson_score || 0) * 100);
+        scormData["cmi.score.raw"] = scormData["cmi.core.score.raw"];
+        scormData["cmi.score.scaled"] = formatScormValue(settings.lesson_score || 0);
+        scormData["cmi.core.lesson_mode"] = getMode();
+        scormData["cmi.mode"] = getMode();
+    }
+
+    function cacheScoreValue(cmi_element, value) {
+        var score = parseFloat(value);
+        if (isNaN(score)) {
+            return;
+        }
+        if (cmi_element === "cmi.score.scaled") {
+            scormData["cmi.score.scaled"] = formatScormValue(score);
+            scormData["cmi.core.score.raw"] = formatScormValue(score * 100);
+            scormData["cmi.score.raw"] = scormData["cmi.core.score.raw"];
+        } else if (cmi_element === "cmi.core.score.raw" || cmi_element === "cmi.score.raw") {
+            scormData["cmi.core.score.raw"] = formatScormValue(score);
+            scormData["cmi.score.raw"] = scormData["cmi.core.score.raw"];
+            scormData["cmi.score.scaled"] = formatScormValue(score / 100);
+        }
+    }
+
+    function cacheScormValue(cmi_element, value) {
+        value = formatScormValue(value);
+        scormData[cmi_element] = value;
+
+        if (cmi_element === "cmi.core.lesson_status") {
+            if (value === "passed" || value === "failed") {
+                scormData["cmi.success_status"] = value;
+            }
+            if (value === "passed") {
+                scormData["cmi.completion_status"] = "completed";
+            } else if (value === "completed" || value === "incomplete" || value === "not attempted" || value === "browsed") {
+                scormData["cmi.completion_status"] = value;
+            }
+        } else if (cmi_element === "cmi.completion_status") {
+            scormData["cmi.core.lesson_status"] = value;
+        } else if (cmi_element === "cmi.success_status") {
+            scormData["cmi.success_status"] = value;
+        } else if (cmi_element === "cmi.core.score.raw" || cmi_element === "cmi.score.raw" || cmi_element === "cmi.score.scaled") {
+            cacheScoreValue(cmi_element, value);
+        }
+    }
+
+    cacheInitialScormValues();
+
+    var GetValue = function (cmi_element) {
+        if (cmi_element === "cmi.core.lesson_mode" || cmi_element === "cmi.mode") {
             navigationClick = false;
-            return settings.scorm_data[cmi_element];
+            return getMode();
+        }
+        if (cmi_element in scormData) {
+            navigationClick = false;
+            return formatScormValue(scormData[cmi_element]);
         }
         navigationClick = false;
         return "";
@@ -220,19 +260,42 @@ function ScormXBlock(runtime, element, settings) {
     
     var setValueEvents = [];
     var processingSetValueEventsQueue = false;
+    var setValueFlushTimeout = null;
+    var setValueFlushDelay = settings.set_value_flush_delay || 250;
     var setValuesUrl = runtime.handlerUrl(element, 'scorm_set_values');
     var SetValue = function (cmi_element, value) {
         SetValueAsync(cmi_element, value);
         return "true";
     }
     function SetValueAsync(cmi_element, value) {
+        cacheScormValue(cmi_element, value);
         setValueEvents.push([cmi_element, value]);
-        if (!processingSetValueEventsQueue) {
-            // There is no running queue processor so we start one
-            processSetValueQueueItems();
+        scheduleSetValueFlush(setValueFlushDelay);
+    }
+    function scheduleSetValueFlush(delay) {
+        if (processingSetValueEventsQueue) {
+            return;
         }
+        if (setValueFlushTimeout) {
+            clearTimeout(setValueFlushTimeout);
+        }
+        setValueFlushTimeout = setTimeout(function () {
+            setValueFlushTimeout = null;
+            processSetValueQueueItems();
+        }, delay);
+    }
+    function FlushSetValueQueue() {
+        if (setValueFlushTimeout) {
+            clearTimeout(setValueFlushTimeout);
+            setValueFlushTimeout = null;
+        }
+        processSetValueQueueItems();
+        return "true";
     }
     function processSetValueQueueItems() {
+        if (processingSetValueEventsQueue) {
+            return;
+        }
         if (setValueEvents.length === 0) {
             // Exit if there is no event left in the queue
             processingSetValueEventsQueue = false;
@@ -241,13 +304,9 @@ function ScormXBlock(runtime, element, settings) {
         processingSetValueEventsQueue = true;
         var data = [];
         while (setValueEvents.length > 0) {
-            params = setValueEvents.shift();
-            cmi_element = params[0];
-            value = params[1];
-            if (!uncachedValues.includes(cmi_element)) {
-                // Update the local scorm data copy to fetch results faster with get_value
-                settings.scorm_data[cmi_element] = value;
-            }
+            var params = setValueEvents.shift();
+            var cmi_element = params[0];
+            var value = params[1];
             data.push({
                 'name': cmi_element,
                 'value': value
@@ -264,18 +323,22 @@ function ScormXBlock(runtime, element, settings) {
                         // Properly display at most two decimals
                         $(element).find(".grade").html(Math.round(result.grade * 100) / 100);
                     }
-                    $(element).find(".completion-status").html(result.completion_status);
+                    if (typeof result.completion_status != "undefined") {
+                        $(element).find(".completion-status").html(result.completion_status);
+                    }
                 }
             },
             complete: function () {
-                // Recursive call to itself
-                processSetValueQueueItems();
+                processingSetValueEventsQueue = false;
+                if (setValueEvents.length > 0) {
+                    scheduleSetValueFlush(0);
+                }
             }
         });
     };
 
     $(function ($) {
-        initScorm(settings.scorm_version, GetValue, SetValue);
+        initScorm(settings.scorm_version, GetValue, SetValue, FlushSetValueQueue);
         initFullscreen();
         initPopupWindow();
         initReports();
