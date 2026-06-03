@@ -50,7 +50,7 @@ setup(
     author="Overhang.IO",
     author_email="contact@overhang.io",
     maintainer="Edly",
-    maintainer_email="zia.fazal@edly.io",
+    maintainer_email="ali.abbas02@arbisoft.com",
     project_urls={
         "Documentation": "https://github.com/overhangio/openedx-scorm-xblock",
         "Code": "https://github.com/overhangio/openedx-scorm-xblock",
