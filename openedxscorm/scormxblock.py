@@ -8,6 +8,7 @@ import zipfile
 import mimetypes
 import urllib
 
+from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db.models import Q
@@ -231,7 +232,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         Response object containing the content of the requested file with the appropriate content type.
         """
         file_name = os.path.basename(suffix)
-        file_path = self.find_file_path(file_name)        
+        file_path = self.find_file_path(file_name)
         file_type, _ = mimetypes.guess_type(file_name)
         with self.storage.open(file_path) as response:
             file_content = response.read()
@@ -380,10 +381,209 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                             ContentFile(scorm_zipfile.read(zipinfo.filename)),
                         )
 
+    def add_xml_to_node(self, node):
+        """
+        Export hook. The platform sets ``runtime.export_fs`` to the OLX
+        export filesystem before calling this. We re-zip the extracted
+        package out of ``default_storage`` into that filesystem so the
+        block roundtrips through OLX export/import. Outside an export
+        context ``export_fs`` is None and this is a pass-through.
+        """
+        super().add_xml_to_node(node)
+
+        export_fs = getattr(self.runtime, "export_fs", None)
+        if export_fs is None:
+            return
+        if not self.package_meta or "sha1" not in self.package_meta:
+            return
+        if not self.path_exists(self.extract_folder_path):
+            return
+
+        zip_relpath = f"scorm/{self.url_name}/package.zip"
+        try:
+            export_fs.makedirs(os.path.dirname(zip_relpath), recreate=True)
+            with export_fs.open(zip_relpath, "wb") as out:
+                self._rezip_extracted_package(out)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to bundle SCORM package into OLX export")
+            return
+
+        node.set("scorm_package_path", zip_relpath)
+
+    @classmethod
+    def parse_xml(cls, node, runtime, keys):
+        """
+        Import hook. After the base class restores fields from XML
+        attributes (so ``package_meta`` and therefore ``extract_folder_path``
+        are populated), look for the package zip the exporter wrote into
+        the OLX tarball and re-extract it into ``default_storage``.
+        """
+        block = super().parse_xml(node, runtime, keys)
+
+        zip_relpath = node.get("scorm_package_path")
+        resources_fs = getattr(runtime, "resources_fs", None)
+        if not zip_relpath or resources_fs is None:
+            return block
+        if not resources_fs.exists(zip_relpath):
+            return block
+
+        # During OLX import the block's ``scope_ids.usage_id`` is keyed to
+        # the source course (the one being imported FROM). The block is
+        # then persisted under the target course's keys.
+        # ``extract_folder_base_path`` hashes ``scope_ids.usage_id`` to
+        # locate files on disk, so extracting under the source key lands
+        # files where the rendered block (keyed to the target course)
+        # cannot find them. Re-key the block in place for the duration
+        # of extraction so files end up where they will be looked up.
+        target_usage_id = cls._target_usage_id_for_import(node, runtime)
+        original_scope_ids = block.scope_ids
+        if target_usage_id is not None and target_usage_id != original_scope_ids.usage_id:
+            block.scope_ids = original_scope_ids._replace(usage_id=target_usage_id)
+
+        try:
+            with resources_fs.open(zip_relpath, "rb") as zip_file:
+                block.extract_package(zip_file)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to rehydrate SCORM package from OLX import")
+        finally:
+            if block.scope_ids is not original_scope_ids:
+                block.scope_ids = original_scope_ids
+
+        return block
+
+    @classmethod
+    def _target_usage_id_for_import(cls, node, runtime):
+        """
+        During OLX import, ``runtime.id_generator`` is a
+        ``CourseImportLocationManager`` that carries ``target_course_id``
+        — the course the block will be persisted under. Combine it with
+        the preserved ``url_name`` (which becomes ``block_id``) to get
+        the usage_id the rendered block will eventually see. Returns
+        ``None`` for runtimes that don't expose this (no-op fallback).
+        """
+        id_generator = getattr(runtime, "id_generator", None)
+        target_course_id = getattr(id_generator, "target_course_id", None)
+        if target_course_id is None:
+            return None
+        url_name = node.get("url_name")
+        if not url_name:
+            return None
+        try:
+            return target_course_id.make_usage_key(node.tag, url_name)
+        except Exception:  # pylint: disable=broad-except
+            return None
+
+    def _rezip_extracted_package(self, out_file):
+        """
+        Stream a fresh zip of the extracted SCORM tree into ``out_file``.
+        Files are read from ``self.storage`` and written through ``zf.open``
+        in chunks so the whole archive is never held in memory at once.
+        """
+        root = self.extract_folder_path
+        with zipfile.ZipFile(out_file, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            stack = [root]
+            while stack:
+                cur = stack.pop()
+                try:
+                    dirs, files = self.storage.listdir(cur)
+                except FileNotFoundError:
+                    continue
+                for d in dirs:
+                    stack.append(os.path.join(cur, d))
+                for f in files:
+                    src_path = os.path.join(cur, f)
+                    arcname = os.path.relpath(src_path, root)
+                    with self.storage.open(src_path, "rb") as fh:
+                        with zf.open(arcname, "w", force_zip64=True) as zout:
+                            for chunk in iter(lambda fh=fh: fh.read(1024 * 1024), b""):
+                                zout.write(chunk)
+
+    def _rehydrate_extract_folder_if_missing(self):
+        """
+        Self-healing: if our extract folder is empty but we know our sha1,
+        search ``scorm_location()`` for another bucket containing the
+        same sha1 directory and copy its tree into our extract folder.
+
+        This covers operations that duplicate block metadata without
+        touching storage — notably course rerun, which clones blocks at
+        the modulestore level and never invokes ``parse_xml``.
+
+        Idempotency is enforced via Django's cache, keyed by
+        ``scope_ids.usage_id``. Course rerun and OLX import both mint a
+        new ``usage_id``, so the cache key naturally misses and a fresh
+        verification fires once on first render of the new block. On
+        success the key is set and subsequent renders short-circuit
+        without listing storage.
+        """
+        cache_key = f"scorm_xblock:extract_verified:{self.scope_ids.usage_id}"
+        if cache.get(cache_key):
+            return
+
+        if not self.package_meta or "sha1" not in self.package_meta:
+            return
+
+        if self.path_exists(self.extract_folder_path):
+            cache.set(cache_key, True, timeout=None)
+            return
+
+        sha1 = self.package_meta["sha1"]
+        scorm_root = self.scorm_location()
+
+        try:
+            bucket_dirs, _ = self.storage.listdir(scorm_root)
+        except FileNotFoundError:
+            return
+
+        own_bucket = os.path.basename(self.extract_folder_base_path)
+        for bucket in bucket_dirs:
+            if bucket == own_bucket:
+                continue
+            candidate = os.path.join(scorm_root, bucket, sha1)
+            if not self.path_exists(candidate):
+                continue
+            try:
+                self._copy_storage_tree(candidate, self.extract_folder_path)
+                logger.info(
+                    "Rehydrated SCORM extract folder for %s from %s",
+                    self.scope_ids.usage_id, candidate,
+                )
+                cache.set(cache_key, True, timeout=None)
+            except Exception:  # pylint: disable=broad-except
+                logger.exception(
+                    "Failed to rehydrate SCORM extract folder for %s from %s",
+                    self.scope_ids.usage_id, candidate,
+                )
+            return
+
+    def _copy_storage_tree(self, src_root, dst_root):
+        """
+        Recursively copy every file under ``src_root`` to ``dst_root``
+        using the Django storage API. Both paths are storage-relative —
+        we never touch the local filesystem directly, so this works on
+        S3 and filesystem backends alike.
+        """
+        stack = [src_root]
+        while stack:
+            cur = stack.pop()
+            try:
+                dirs, files = self.storage.listdir(cur)
+            except FileNotFoundError:
+                continue
+            for d in dirs:
+                stack.append(os.path.join(cur, d))
+            for f in files:
+                src_path = os.path.join(cur, f)
+                relpath = os.path.relpath(src_path, src_root)
+                dst_path = os.path.join(dst_root, relpath)
+                with self.storage.open(src_path, "rb") as src_fh:
+                    self.storage.save(dst_path, ContentFile(src_fh.read()))
+
     @property
     def index_page_url(self):
         if not self.package_meta or not self.index_page_path:
             return ""
+
+        self._rehydrate_extract_folder_if_missing()
         
         # Serve assets by proxying them through the LMS by default
         if self.xblock_settings.get("PROXY_ASSETS_LMS", True):
