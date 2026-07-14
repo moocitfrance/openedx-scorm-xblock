@@ -2,7 +2,21 @@ function ScormStudioXBlock(runtime, element) {
 
     var handlerUrl = runtime.handlerUrl(element, 'studio_submit');
 
+    function getFreshCsrfToken() {
+        return $.ajax({
+            url: '/csrf/api/v1/token',
+            type: 'GET',
+            dataType: 'json',
+            cache: false
+        }).then(function (response) {
+            return response.csrfToken;
+        }, function () {
+            return $.cookie ? $.cookie('csrftoken') : null;
+        });
+    }
+
     $(element).find('.save-button').bind('click', function () {
+        var saveButton = $(this);
         var form_data = new FormData();
         var file_data = $(element).find('#scorm_file').prop('files')[0];
         var display_name = $(element).find('input[name=display_name]').val();
@@ -29,32 +43,37 @@ function ScormStudioXBlock(runtime, element) {
             state: 'start'
         });
 
-        $(this).addClass("disabled");
-        $.ajax({
-            url: handlerUrl,
-            dataType: 'json',
-            cache: false,
-            contentType: false,
-            processData: false,
-            data: form_data,
-            type: "POST",
-            complete: function () {
-                $(this).removeClass("disabled");
-            },
-            success: function (response) {
-                if (response.errors.length > 0) {
-                    response.errors.forEach(function (error) {
-                        runtime.notify("error", {
-                            "message": error,
-                            "title": "Scorm component save error"
+        saveButton.addClass("disabled");
+        getFreshCsrfToken().then(function (csrfToken) {
+            $.ajax({
+                url: handlerUrl,
+                dataType: 'json',
+                cache: false,
+                contentType: false,
+                processData: false,
+                data: form_data,
+                type: "POST",
+                headers: {
+                    'X-CSRFToken': csrfToken
+                },
+                complete: function () {
+                    saveButton.removeClass("disabled");
+                },
+                success: function (response) {
+                    if (response.errors.length > 0) {
+                        response.errors.forEach(function (error) {
+                            runtime.notify("error", {
+                                "message": error,
+                                "title": "Scorm component save error"
+                            });
                         });
-                    });
-                } else {
-                    runtime.notify('save', {
-                        state: 'end'
-                    });
+                    } else {
+                        runtime.notify('save', {
+                            state: 'end'
+                        });
+                    }
                 }
-            }
+            });
         });
 
     });
