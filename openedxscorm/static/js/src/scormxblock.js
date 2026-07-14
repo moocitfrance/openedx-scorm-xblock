@@ -1,5 +1,18 @@
 function ScormXBlock(runtime, element, settings) {
 
+    function getFreshCsrfToken() {
+        return $.ajax({
+            url: '/csrf/api/v1/token',
+            type: 'GET',
+            dataType: 'json',
+            cache: false
+        }).then(function (response) {
+            return response.csrfToken;
+        }, function () {
+            return $.cookie ? $.cookie('csrftoken') : null;
+        });
+    }
+
     // Fullscreen
     function initFullscreen() {
         const xblock = $(element).find(".scorm-xblock").get(0);
@@ -312,28 +325,33 @@ function ScormXBlock(runtime, element, settings) {
                 'value': value
             })
         }
-        $.ajax({
-            type: "POST",
-            url: setValuesUrl,
-            data: JSON.stringify(data),
-            success: function (results) {
-                for (var i = 0; i < results.length; i += 1) {
-                    var result = results[i];
-                    if (typeof result.grade != "undefined") {
-                        // Properly display at most two decimals
-                        $(element).find(".grade").html(Math.round(result.grade * 100) / 100);
+        getFreshCsrfToken().then(function (csrfToken) {
+            $.ajax({
+                type: "POST",
+                url: setValuesUrl,
+                data: JSON.stringify(data),
+                headers: {
+                    'X-CSRFToken': csrfToken
+                },
+                success: function (results) {
+                    for (var i = 0; i < results.length; i += 1) {
+                        var result = results[i];
+                        if (typeof result.grade != "undefined") {
+                            // Properly display at most two decimals
+                            $(element).find(".grade").html(Math.round(result.grade * 100) / 100);
+                        }
+                        if (typeof result.completion_status != "undefined") {
+                            $(element).find(".completion-status").html(result.completion_status);
+                        }
                     }
-                    if (typeof result.completion_status != "undefined") {
-                        $(element).find(".completion-status").html(result.completion_status);
+                },
+                complete: function () {
+                    processingSetValueEventsQueue = false;
+                    if (setValueEvents.length > 0) {
+                        scheduleSetValueFlush(0);
                     }
                 }
-            },
-            complete: function () {
-                processingSetValueEventsQueue = false;
-                if (setValueEvents.length > 0) {
-                    scheduleSetValueFlush(0);
-                }
-            }
+            });
         });
     };
 
