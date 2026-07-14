@@ -212,5 +212,4 @@ var module, window, define, renderjson=(function() {
     return renderjson;
 })();
 
-if (define) define({renderjson:renderjson})
-else (module||{}).exports = (window||{}).renderjson = renderjson;
+(module||{}).exports = (window||{}).renderjson = renderjson;
