@@ -1,0 +1,1 @@
+- [Bugfix] Preserve complete relative paths when proxying SCORM assets, preventing files with duplicate basenames from being replaced by the first matching file elsewhere in the package. Reject path-traversal attempts before accessing storage. (by @moocitfrance)

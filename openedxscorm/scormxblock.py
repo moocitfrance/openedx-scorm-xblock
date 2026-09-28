@@ -2,6 +2,7 @@ import json
 import hashlib
 import os
 import logging
+import posixpath
 import re
 import xml.etree.ElementTree as ET
 import zipfile
@@ -234,14 +235,49 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         -------
         Response object containing the content of the requested file with the appropriate content type.
         """
-        file_name = os.path.basename(suffix)
-        file_path = self.find_file_path(file_name)
+        file_path = self.resolve_asset_path(suffix)
+        file_name = posixpath.basename(file_path)
         file_type, _ = mimetypes.guess_type(file_name)
         with self.storage.open(file_path) as response:
             file_content = response.read()
 
 
         return Response(file_content, content_type=file_type)
+
+    def resolve_asset_path(self, suffix):
+        """Resolve an asset URL to the matching file inside this SCORM package.
+
+        SCORM packages commonly reuse filenames in different directories. Keep
+        the complete relative path from the handler suffix so that, for example,
+        ``res/data/img1.png`` and ``res/data/scenario1/img1.png`` remain distinct.
+        """
+        asset_path = self.clean_path(urllib.parse.unquote(suffix or ""))
+        asset_path = asset_path.replace(OS_PATH_ALT_SEP, "/")
+        path_parts = asset_path.split("/")
+
+        if (
+            not asset_path
+            or asset_path.startswith("/")
+            or any(part == ".." for part in path_parts)
+        ):
+            raise ScormError(f"Invalid asset path: '{suffix}'")
+
+        asset_path = posixpath.normpath(asset_path)
+        candidates = (
+            posixpath.join(self.extract_folder_path, asset_path),
+            posixpath.join(self.extract_folder_base_path, asset_path),
+        )
+        for candidate in candidates:
+            if self.storage.exists(candidate):
+                return candidate
+
+        # Preserve support for older packages that reference a bare filename
+        # while storing it in a nested directory. Never use this fallback for a
+        # path containing directories, as that would reintroduce collisions.
+        if "/" not in asset_path:
+            return self.find_file_path(asset_path)
+
+        raise ScormError(f"Invalid package: could not find '{asset_path}' file")
 
     def studio_view(self, context=None):
         # Note that we cannot use xblockutils's StudioEditableXBlockMixin because we

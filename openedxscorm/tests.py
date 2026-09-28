@@ -8,7 +8,7 @@ from freezegun import freeze_time
 import mock
 from xblock.field_data import DictFieldData
 
-from .scormxblock import ScormXBlock
+from .scormxblock import ScormError, ScormXBlock
 
 
 @ddt
@@ -123,6 +123,51 @@ class ScormXBlockTests(unittest.TestCase):
         file_storage_path = block.package_path
 
         self.assertEqual(file_storage_path, "org/course/block_type/block_id/sha1.html")
+
+    @mock.patch(
+        "openedxscorm.ScormXBlock.extract_folder_base_path",
+        new_callable=mock.PropertyMock,
+        return_value="scorm/block",
+    )
+    @mock.patch(
+        "openedxscorm.ScormXBlock.extract_folder_path",
+        new_callable=mock.PropertyMock,
+        return_value="scorm/block/package-sha1",
+    )
+    def test_assets_proxy_preserves_relative_path(self, _extract_path, _base_path):
+        block = self.make_one()
+        block._storage = mock.MagicMock()
+        expected_path = "scorm/block/package-sha1/res/data/scenario1/img1.png"
+        block.storage.exists.side_effect = lambda path: path == expected_path
+        opened_file = block.storage.open.return_value.__enter__.return_value
+        opened_file.read.return_value = b"doctor-image"
+
+        response = block.assets_proxy(
+            mock.Mock(), "res/data/scenario1/img1.png"
+        )
+
+        block.storage.open.assert_called_once_with(expected_path)
+        self.assertEqual(response.body, b"doctor-image")
+        self.assertEqual(response.content_type, "image/png")
+
+    @mock.patch(
+        "openedxscorm.ScormXBlock.extract_folder_base_path",
+        new_callable=mock.PropertyMock,
+        return_value="scorm/block",
+    )
+    @mock.patch(
+        "openedxscorm.ScormXBlock.extract_folder_path",
+        new_callable=mock.PropertyMock,
+        return_value="scorm/block/package-sha1",
+    )
+    def test_resolve_asset_path_rejects_traversal(self, _extract_path, _base_path):
+        block = self.make_one()
+        block._storage = mock.Mock()
+
+        with self.assertRaisesRegex(ScormError, "Invalid asset path"):
+            block.resolve_asset_path("res/%2e%2e/secret.txt")
+
+        block.storage.exists.assert_not_called()
 
     @mock.patch(
         "openedxscorm.ScormXBlock._file_storage_path", return_value="file_storage_path"
